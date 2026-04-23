@@ -1,108 +1,78 @@
-# Petra Telecom Churn Prediction — Model Comparison Workflow
+# Petra Telecom Churn Model Comparison CLI
 
-A reproducible machine learning workflow for comparing baseline, linear, and tree-based classifiers on Petra Telecom churn data.
+A production-style command-line tool for comparing churn classification models, selecting an operating threshold from out-of-fold training predictions, and generating reproducible evaluation artifacts for business decision-making.
 
-This repository contains two implementations:
+## Overview
 
-- **`model_comparison.py`** — the original assignment solution that completes the required 9 tasks and writes the required assignment artifacts to **`results/`**.
-- **`model_comparison_enhanced.py`** — an extended version that preserves the original structure while adding stronger analysis and engineering features such as threshold tuning, error analysis, calibration metrics, run logging, timestamped run folders, and JSON-based configuration. Its outputs are written to **`results_enhanced/`**.
+This project evaluates multiple classification pipelines for Petra Telecom churn prediction and turns the workflow into a reusable CLI application instead of a notebook-only analysis. The script:
 
-## Project Goals
+- compares six model configurations with stratified cross-validation
+- selects the best model using cross-validated PR-AUC by default
+- chooses an operating threshold from training out-of-fold predictions
+- evaluates the selected operating point on a held-out test set
+- saves plots, reports, logs, metadata, and model artifacts to an output directory
 
-This project is designed to answer a practical business question:
+The current default run selects **RF_default** as the best model and chooses **0.20** as the operating threshold using the `best_f1` strategy on out-of-fold training predictions.
 
-> **Which model should Petra Telecom use to rank customers by churn risk, and what tradeoffs come with that decision?**
+## Features
 
-The workflow compares six classification pipelines, evaluates them with 5-fold stratified cross-validation, generates diagnostic plots, saves the best model, and produces analysis artifacts that support a decision memo.
+- **Command-line interface** with clear arguments and help text
+- **Dry-run mode** to validate data and configuration without training models
+- **Cross-validation model comparison** across six configurations
+- **Threshold selection without test leakage** using training out-of-fold probabilities
+- **Calibration analysis** with calibration curves, Brier score, and ECE
+- **Error analysis** at the selected operating threshold
+- **Tree-vs-linear disagreement analysis** for interpretability
+- **Data quality report** with integrity checks and suspicious-pattern detection
+- **Run metadata and snapshot outputs** for reproducibility
 
-## Model Families Compared
+## Models Compared
 
-The base workflow compares these six model configurations:
+The default configuration compares six pipelines:
 
-1. **Dummy** — majority-class baseline
-2. **LR_default** — logistic regression with standard scaling
-3. **LR_balanced** — class-balanced logistic regression with standard scaling
-4. **DT_depth5** — decision tree with max depth 5
-5. **RF_default** — random forest with 100 trees and max depth 10
-6. **RF_balanced** — class-balanced random forest with 100 trees and max depth 10
+1. `Dummy`
+2. `LR_default`
+3. `LR_balanced`
+4. `DT_depth5`
+5. `RF_default`
+6. `RF_balanced`
 
-## Key Features
+Logistic regression pipelines use median imputation and standard scaling. Tree-based pipelines use median imputation without scaling.
 
-### Base workflow (`model_comparison.py`)
-
-- Loads and splits the telecom churn dataset
-- Defines 6 sklearn pipelines
-- Runs 5-fold stratified cross-validation
-- Reports mean and standard deviation for:
-  - Accuracy
-  - Precision
-  - Recall
-  - F1
-  - PR-AUC
-- Saves a model comparison table
-- Plots precision-recall curves for the top 3 models
-- Plots calibration curves for the top 3 models
-- Saves the best model with `joblib`
-- Logs experiment results to CSV
-- Finds a sample where random forest and logistic regression disagree most
-
-### Enhanced workflow (`model_comparison_enhanced.py`)
-
-In addition to everything above, the enhanced version adds:
-
-- **Threshold tuning** for the selected best model
-- **Error analysis** for false positives and false negatives
-- **Full test-set prediction export** for every model
-- **Calibration metrics** (`Brier score` and `ECE`)
-- **Structured logging** to console and file
-- **Timestamped run folders** for experiment snapshots
-- **Config-driven execution** with optional `config.json`
-- **`ModelSelector` helper** for cleaner model orchestration
-
-## Repository Structure
+## Project Structure
 
 ```text
 .
+├── model_comparison.py
+├── README.md
+├── DECISION_MEMO.md
+├── requirements.txt
+├── config.json                # optional
 ├── data/
 │   └── telecom_churn.csv
-├── model_comparison.py
-├── model_comparison_enhanced.py
-├── config.example.json
-├── setup.sh
-├── results/
-│   ├── comparison_table.csv
-│   ├── pr_curves.png
-│   ├── calibration.png
-│   ├── best_model.joblib
-│   ├── experiment_log.csv
-│   └── tree_vs_linear_disagreement.md
-├── results_enhanced/
-│   ├── comparison_table.csv
-│   ├── pr_curves.png
-│   ├── calibration.png
-│   ├── best_model.joblib
-│   ├── experiment_log.csv
-│   ├── tree_vs_linear_disagreement.md
-│   ├── test_predictions.csv
-│   ├── calibration_metrics.csv
-│   ├── threshold_tuning.csv
-│   ├── threshold_sweep.png
-│   ├── error_analysis.md
-│   ├── run_metadata.json
-│   └── runs/
-│       └── <timestamp>/
-│           ├── run.log
-│           └── ...snapshot of outputs...
-└── README.md
+└── output/
+    ├── comparison_table.csv
+    ├── pr_curves.png
+    ├── calibration.png
+    ├── best_model.joblib
+    ├── experiment_log.csv
+    ├── threshold_tuning.csv
+    ├── threshold_sweep.png
+    ├── threshold_recommendation.md
+    ├── operating_metrics.json
+    ├── calibration_metrics.csv
+    ├── test_predictions.csv
+    ├── error_analysis.md
+    ├── tree_vs_linear_disagreement.md
+    ├── data_quality_report.json
+    ├── run_metadata.json
+    └── runs/
+        └── <timestamp>/
 ```
 
 ## Installation
 
-You can set up the project in either of these ways.
-
-### Option 1 — Manual setup
-
-Create and activate a virtual environment, then install the required packages.
+Create and activate a virtual environment, then install dependencies.
 
 ```bash
 python -m venv .venv
@@ -110,200 +80,228 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### Option 2 — Setup script
+## Requirements
 
-A convenience script is included to automate environment setup.
+Example `requirements.txt`:
+
+```txt
+numpy>=1.24
+pandas>=2.0
+matplotlib>=3.7
+joblib>=1.3
+scikit-learn>=1.3
+```
+
+## Usage
 
 ```bash
-bash setup.sh
+python model_comparison.py --data-path DATASET.csv [options]
 ```
 
-If the script needs execute permission first:
+### Arguments
+
+| Argument | Required | Default | Description |
+|---|---:|---:|---|
+| `--data-path` | Yes | — | Path to the input CSV dataset |
+| `--output-dir` | No | `./output` | Directory where all artifacts will be saved |
+| `--n-folds` | No | `5` | Number of stratified cross-validation folds |
+| `--random-seed` | No | `42` | Random seed for reproducibility |
+| `--dry-run` | No | off | Validate the dataset and configuration without training |
+| `--config-path` | No | `config.json` | Optional path to a JSON config file |
+| `--log-level` | No | `INFO` | Logging level: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` |
+
+## Example Commands
+
+### 1) Dry run
 
 ```bash
-chmod +x setup.sh
-./setup.sh
+python model_comparison.py \
+  --data-path data/telecom_churn.csv \
+  --dry-run
 ```
 
-After setup finishes, activate the virtual environment if needed:
+Use this first to confirm that:
+
+- the dataset exists
+- required columns are present
+- class distribution is valid
+- cross-validation settings are feasible
+- output paths and configuration are correct
+
+### 2) Standard run
 
 ```bash
-source .venv/bin/activate
+python model_comparison.py \
+  --data-path data/telecom_churn.csv \
+  --output-dir output
 ```
 
-## How to Run
-
-### Run the base version
+### 3) Custom CV and logging level
 
 ```bash
-python model_comparison.py
+python model_comparison.py \
+  --data-path data/telecom_churn.csv \
+  --output-dir output_debug \
+  --n-folds 7 \
+  --random-seed 123 \
+  --log-level DEBUG
 ```
 
-This writes the required assignment outputs to:
+## Optional Configuration File
 
-```text
-results/
-```
+You can place a `config.json` file next to the script or pass a custom path with `--config-path`.
 
-### Run the enhanced version
+CLI arguments override config values.
 
-```bash
-python model_comparison_enhanced.py
-```
-
-This writes the enhanced outputs to:
-
-```text
-results_enhanced/
-```
-
-## Optional Configuration
-
-The enhanced workflow supports an optional `config.json` file placed next to the script.
-
-Start from the provided example:
-
-```bash
-cp config.example.json config.json
-```
-
-Then edit values such as:
-
-- `random_state`
-- `data_path`
-- `results_root`
-- `n_splits`
-- `selection_metric`
-- `calibration_bins`
-- `error_analysis_top_n`
-- `thresholds`
-- model definitions and hyperparameters
-
-### Example
+Example:
 
 ```json
 {
-  "random_state": 42,
-  "results_root": "results_enhanced",
-  "n_splits": 5,
-  "selection_metric": "pr_auc_mean"
+  "selection_metric": "pr_auc_mean",
+  "threshold_selection_strategy": "best_f1",
+  "recall_target": 0.8,
+  "max_alert_rate": null,
+  "calibration_bins": 10,
+  "error_analysis_top_n": 10,
+  "run_snapshot": true
 }
 ```
 
-## Methodology
+## Output Artifacts
 
-### 1. Data preparation
+A successful run generates the following artifacts:
 
-The workflow uses the following numeric features:
+### Core artifacts
 
-- `tenure`
-- `monthly_charges`
-- `total_charges`
-- `num_support_calls`
-- `senior_citizen`
-- `has_partner`
-- `has_dependents`
-- `contract_months`
+- **`comparison_table.csv`** — cross-validated metrics for all models
+- **`pr_curves.png`** — precision-recall curves for the top models
+- **`calibration.png`** — calibration curves for the top models
+- **`best_model.joblib`** — serialized best model fitted on the full training set
+- **`experiment_log.csv`** — flat experiment log with timestamped summary metrics
 
-The target is:
+### Threshold and deployment artifacts
 
-- `churned`
+- **`threshold_tuning.csv`** — threshold sweep table using training out-of-fold predictions
+- **`threshold_sweep.png`** — plot of precision, recall, F1, and alerts per 1,000 by threshold
+- **`threshold_recommendation.md`** — selected operating threshold and alternative candidates
+- **`operating_metrics.json`** — final test-set metrics at the selected operating threshold
 
-The data is split into train and test sets using an **80/20 stratified split**.
+### Diagnostics and interpretability artifacts
 
-### 2. Cross-validation
+- **`calibration_metrics.csv`** — Brier score, ECE, and test PR-AUC for each model
+- **`test_predictions.csv`** — row-level predicted probabilities and class decisions
+- **`error_analysis.md`** — highest-confidence false positives and lowest-confidence false negatives
+- **`tree_vs_linear_disagreement.md`** — an example showing how tree and linear models differ structurally
+- **`data_quality_report.json`** — dataset checks and suspicious data patterns
+- **`run_metadata.json`** — saved configuration, selected model, threshold, and evaluation summary
 
-All six pipelines are evaluated with **5-fold stratified cross-validation**.
+### Snapshot artifacts
 
-The workflow records:
+- **`output/runs/<timestamp>/`** — a snapshot copy of the major outputs for reproducibility
 
-- mean score across folds
-- standard deviation across folds
+## Decision Summary
 
-This helps compare both **performance** and **stability**.
+For the final model recommendation and business-facing deployment rationale, see **`DECISION_MEMO.md`**.
 
-### 3. Ranking metric
+## Current Result Summary
 
-The main model-selection metric is **PR-AUC** because churn prediction is an imbalanced classification problem and PR-AUC focuses on positive-class ranking quality.
+From the current run:
 
-### 4. Diagnostics
+- **Best model:** `RF_default`
+- **Model selection metric:** `pr_auc_mean`
+- **Selected threshold:** `0.20`
+- **Threshold strategy:** `best_f1`
 
-The workflow includes multiple diagnostic layers:
+### Test-set operating metrics at threshold 0.20
 
-- **PR curves** to inspect precision–recall tradeoffs
-- **Calibration curves** to inspect probability reliability
-- **Threshold tuning** to inspect decision-threshold tradeoffs
-- **Error analysis** to inspect false positives and false negatives
-- **Tree-vs-linear disagreement analysis** to show structural differences between model families
+- Accuracy: **0.7389**
+- Precision: **0.3406**
+- Recall: **0.6395**
+- F1: **0.4444**
+- PR-AUC: **0.4484**
+- Brier score: **0.1129**
+- Predicted positives: **276 / 900**
+- Alert rate: **0.3067**
 
-## Generated Outputs
+### Confusion matrix at threshold 0.20
 
-### Required assignment outputs
+- TN: **571**
+- FP: **182**
+- FN: **53**
+- TP: **94**
 
-These are produced by `model_comparison.py` and saved in `results/`:
+### Interpretation
 
-- `results/comparison_table.csv`
-- `results/pr_curves.png`
-- `results/calibration.png`
-- `results/best_model.joblib`
-- `results/experiment_log.csv`
-- `results/tree_vs_linear_disagreement.md`
+The selected threshold produces a much more recall-oriented operating point than the default `0.50` threshold. This makes the model more useful for churn intervention, but it also increases false positives and outreach volume. In other words, the current setup is appropriate when catching more true churners is more valuable than minimizing unnecessary retention offers.
 
-### Enhanced outputs
+## Data Quality Notes
 
-These are produced by `model_comparison_enhanced.py` and saved in `results_enhanced/`:
+The latest data quality report shows:
 
-- `results_enhanced/comparison_table.csv`
-- `results_enhanced/pr_curves.png`
-- `results_enhanced/calibration.png`
-- `results_enhanced/best_model.joblib`
-- `results_enhanced/experiment_log.csv`
-- `results_enhanced/tree_vs_linear_disagreement.md`
-- `results_enhanced/test_predictions.csv`
-- `results_enhanced/calibration_metrics.csv`
-- `results_enhanced/threshold_tuning.csv`
-- `results_enhanced/threshold_sweep.png`
-- `results_enhanced/error_analysis.md`
-- `results_enhanced/run_metadata.json`
-- `results_enhanced/runs/<timestamp>/run.log`
+- `4500` rows and `14` columns
+- no missing values in the required modeling columns
+- no duplicate rows
+- no negative numeric values in the required features
+- **278 suspicious rows** where `tenure > 3` and `total_charges == 0`
 
-## Results vs. Results Enhanced
+That last pattern should be reviewed because it may represent a data-entry issue, a business edge case, or zero-filled missing values.
 
-The `results/` directory contains the required base-task outputs produced by `model_comparison.py`, including the comparison table, PR curves, calibration plot, saved best model, experiment log, and tree-vs-linear disagreement analysis. The `results_enhanced/` directory contains the outputs of `model_comparison_enhanced.py`, which preserves the same core workflow and model selection outcome while adding extra analysis layers such as threshold tuning, calibration metrics, full test-set prediction exports, error analysis, run metadata, and timestamped run folders. In other words, `results/` is the assignment submission output, while `results_enhanced/` is an extended analysis and engineering version built on top of the same underlying comparison pipeline.
+## Threshold Selection Logic
 
-## Example Interpretation
+Threshold selection is intentionally done on **training out-of-fold predictions**, not on the held-out test set. This keeps the final test set reserved for honest evaluation.
 
-A typical run of the project leads to conclusions like these:
+Supported threshold strategies:
 
-- **Random forest** can achieve the strongest **PR-AUC**, making it the best model for ranking customers by churn risk.
-- **Balanced models** often increase **recall** at the default 0.5 threshold, but this does not always improve **threshold-independent ranking quality**.
-- **Calibration analysis** helps determine whether model probabilities can support prioritization and early warning.
-- **Threshold tuning** is useful when business capacity is limited and the retention team cannot contact every predicted churner.
+- **`best_f1`** — choose the threshold that maximizes out-of-fold F1
+- **`target_recall_with_best_precision`** — among thresholds meeting the recall target, choose the one with the best precision
+- **`max_recall_at_or_below_alert_rate`** — among thresholds under the alert-rate cap, choose the one with the highest recall
 
-## Suggested Structural Explanation for `results_enhanced/tree_vs_linear_disagreement.md`
+## Why PR-AUC Is the Default Selection Metric
 
-The disagreement is likely driven by a threshold-style pattern around `contract_months = 1`, which the random forest can treat as a strong churn signal when combined with the rest of the feature profile. In this sample, the tree model assigned a much higher churn probability than logistic regression, suggesting that the tree captured a rule-like interaction that the linear model smoothed out through additive feature effects. This interpretation is also consistent with the enhanced error analysis, where the same sample appeared among the highest-confidence false positives, showing that the random forest can sometimes overreact to short-contract risk patterns even when the true label is non-churn.
+The churn dataset is imbalanced, so accuracy alone is not a reliable ranking criterion. PR-AUC is more informative because it measures how well a model ranks the minority class across possible thresholds.
 
-## Why the Enhanced Version Exists
+## Troubleshooting
 
-The original script solves the assignment requirements and remains the main deliverable.
+### File not found
 
-The enhanced script was added to extend the project in a more production-like direction without replacing the required submission. It keeps the original workflow structure but makes the project more reusable, traceable, and analytically rich.
+If you see a file-not-found error, confirm the path passed to `--data-path`.
 
-## Suggested Next Improvements
+```bash
+python model_comparison.py --data-path data/telecom_churn.csv --dry-run
+```
 
-If you want to extend the project further, good next steps include:
+### Validation failed
 
-- permutation importance
-- nested cross-validation
-- hyperparameter search
-- probability calibration methods such as Platt scaling or isotonic regression
-- richer model registry support in the config workflow
-- deployment packaging for inference
+If validation fails, check:
 
-## Notes
+- required columns exist
+- `churned` is binary
+- CV folds are not larger than the minority-class count
+- numeric features do not contain invalid text values
 
-- Generated result files are typically ignored by Git through `.gitignore`.
-- The enhanced workflow writes its canonical outputs to `results_enhanced/`, with timestamped snapshots saved under `results_enhanced/runs/`.
-- The original `model_comparison.py` file remains part of the repository and is not replaced by the enhanced version.
-- `setup.sh` is provided as a convenience helper for local environment setup.
+### Output looks too conservative or too aggressive
+
+Review:
+
+- `threshold_recommendation.md`
+- `threshold_tuning.csv`
+- `operating_metrics.json`
+
+If outreach capacity is limited, use a more restrictive threshold strategy or introduce `max_alert_rate` in `config.json`.
+
+## Reproducibility
+
+Each run saves:
+
+- the selected best model
+- the selected operating threshold
+- the configuration used
+- the data quality report
+- the operating metrics
+- a timestamped snapshot of outputs
+
+This makes it easier to compare runs and trace how a deployment recommendation was produced.
+
+## License
+
+This project is for educational and portfolio use unless you add a separate license file.

@@ -1,29 +1,30 @@
 """
-Module 5 Week B — Integration Task: Model Comparison & Decision Memo
+Petra Telecom churn model comparison CLI.
 
-Enhanced version that preserves the original task structure while adding:
-- threshold tuning
-- error analysis
-- full test prediction exports
-- calibration metrics (Brier score + ECE)
-- structured logging
-- timestamped run folders
-- simple JSON config workflow
-- ModelSelector helper class
+This script compares multiple churn classifiers, selects the best model by
+cross-validated ranking performance, chooses an operating threshold from
+out-of-fold training predictions, evaluates the selected operating point on
+the held-out test set, and saves reproducible artifacts for analysis and
+deployment.
 
-Run with:  python model_comparison_enhanced.py
-Optional config: create config.json next to the script.
+Run with:
+    python model_comparison.py --data-path data/telecom_churn.csv
+    python model_comparison.py --data-path data/telecom_churn.csv --dry-run
+
+Optional:
+    create config.json next to the script or pass --config-path.
+    CLI arguments take precedence over config values.
 """
 
+import argparse
 import copy
 import json
 import logging
 import os
 import shutil
+import sys
 from datetime import datetime
 
-# Use a non-interactive matplotlib backend so plots save cleanly in CI
-# and on headless environments.
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -31,15 +32,18 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from joblib import dump
+from sklearn.base import clone
 from sklearn.calibration import CalibrationDisplay
 from sklearn.dummy import DummyClassifier
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     PrecisionRecallDisplay,
     accuracy_score,
     average_precision_score,
     brier_score_loss,
+    confusion_matrix,
     f1_score,
     precision_score,
     recall_score,
@@ -61,15 +65,41 @@ NUMERIC_FEATURES = [
     "contract_months",
 ]
 
+BINARY_FEATURES = [
+    "senior_citizen",
+    "has_partner",
+    "has_dependents",
+]
+
+ALLOWED_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
+ALLOWED_SELECTION_METRICS = {
+    "accuracy_mean",
+    "precision_mean",
+    "recall_mean",
+    "f1_mean",
+    "pr_auc_mean",
+}
+ALLOWED_THRESHOLD_STRATEGIES = {
+    "best_f1",
+    "target_recall_with_best_precision",
+    "max_recall_at_or_below_alert_rate",
+}
+
 DEFAULT_CONFIG = {
     "random_state": 42,
     "data_path": "data/telecom_churn.csv",
-    "results_root": "results_enhanced",
+    "results_root": "./output",
     "n_splits": 5,
     "selection_metric": "pr_auc_mean",
     "calibration_bins": 10,
     "error_analysis_top_n": 10,
     "thresholds": [round(float(x), 2) for x in np.arange(0.10, 0.91, 0.05)],
+    "threshold_selection_strategy": "best_f1",
+    "recall_target": 0.80,
+    "max_alert_rate": None,
+    "customer_base": 10000,
+    "log_level": "INFO",
+    "run_snapshot": True,
     "models": [
         {
             "name": "Dummy",
@@ -103,7 +133,12 @@ DEFAULT_CONFIG = {
             "name": "RF_default",
             "type": "random_forest",
             "scaler": "passthrough",
-            "params": {"n_estimators": 100, "max_depth": 10, "random_state": 42},
+            "params": {
+                "n_estimators": 100,
+                "max_depth": 10,
+                "random_state": 42,
+                "n_jobs": -1,
+            },
         },
         {
             "name": "RF_balanced",
@@ -114,23 +149,26 @@ DEFAULT_CONFIG = {
                 "max_depth": 10,
                 "class_weight": "balanced",
                 "random_state": 42,
+                "n_jobs": -1,
             },
         },
     ],
 }
 
-LOGGER = logging.getLogger("model_comparison")
-
 
 def ensure_parent_dir(path):
-    """Create the parent directory for a path if needed."""
     parent = os.path.dirname(path)
     if parent:
         os.makedirs(parent, exist_ok=True)
 
 
+def save_json(data, output_path):
+    ensure_parent_dir(output_path)
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+
 def deep_update(base, updates):
-    """Recursively merge config dictionaries."""
     merged = copy.deepcopy(base)
     for key, value in updates.items():
         if isinstance(value, dict) and isinstance(merged.get(key), dict):
@@ -141,7 +179,6 @@ def deep_update(base, updates):
 
 
 def load_config(config_path="config.json"):
-    """Load config.json if present, otherwise use defaults."""
     config = copy.deepcopy(DEFAULT_CONFIG)
     if os.path.exists(config_path):
         with open(config_path, "r", encoding="utf-8") as f:
@@ -150,11 +187,172 @@ def load_config(config_path="config.json"):
     return config
 
 
-def setup_logging(log_path):
-    """Configure console + file logging."""
+def apply_random_seed_to_config(config, random_seed):
+    updated_config = copy.deepcopy(config)
+    updated_config["random_state"] = random_seed
+
+    for model_cfg in updated_config.get("models", []):
+        model_type = model_cfg.get("type")
+        params = model_cfg.setdefault("params", {})
+        if model_type in {"logistic_regression", "decision_tree", "random_forest"}:
+            params["random_state"] = random_seed
+
+    return updated_config
+
+
+def apply_cli_overrides(config, args):
+    updated = apply_random_seed_to_config(config, args.random_seed)
+    updated["data_path"] = args.data_path
+    updated["results_root"] = args.output_dir
+    updated["n_splits"] = args.n_folds
+    updated["log_level"] = args.log_level.upper()
+    return updated
+
+
+def validate_config(config):
+    if config["selection_metric"] not in ALLOWED_SELECTION_METRICS:
+        raise ValueError(
+            f"Unsupported selection_metric: {config['selection_metric']}. "
+            f"Allowed: {sorted(ALLOWED_SELECTION_METRICS)}"
+        )
+
+    if config["log_level"].upper() not in ALLOWED_LOG_LEVELS:
+        raise ValueError(
+            f"Unsupported log level: {config['log_level']}. "
+            f"Allowed: {sorted(ALLOWED_LOG_LEVELS)}"
+        )
+
+    if not isinstance(config["n_splits"], int) or config["n_splits"] < 2:
+        raise ValueError("n_splits must be an integer >= 2.")
+
+    if not isinstance(config["calibration_bins"], int) or config["calibration_bins"] < 2:
+        raise ValueError("calibration_bins must be an integer >= 2.")
+
+    if not isinstance(config["error_analysis_top_n"], int) or config["error_analysis_top_n"] < 1:
+        raise ValueError("error_analysis_top_n must be an integer >= 1.")
+
+    thresholds = config.get("thresholds", [])
+    if not isinstance(thresholds, list) or len(thresholds) == 0:
+        raise ValueError("thresholds must be a non-empty list.")
+    if thresholds != sorted(thresholds):
+        raise ValueError("thresholds must be sorted in ascending order.")
+    if len(set(thresholds)) != len(thresholds):
+        raise ValueError("thresholds must not contain duplicates.")
+    if any((t <= 0 or t >= 1) for t in thresholds):
+        raise ValueError("All thresholds must be strictly between 0 and 1.")
+
+    strategy = config.get("threshold_selection_strategy")
+    if strategy not in ALLOWED_THRESHOLD_STRATEGIES:
+        raise ValueError(
+            f"Unsupported threshold_selection_strategy: {strategy}. "
+            f"Allowed: {sorted(ALLOWED_THRESHOLD_STRATEGIES)}"
+        )
+
+    recall_target = config.get("recall_target")
+    if recall_target is not None and not (0 < recall_target <= 1):
+        raise ValueError("recall_target must be between 0 and 1.")
+
+    max_alert_rate = config.get("max_alert_rate")
+    if max_alert_rate is not None and not (0 < max_alert_rate <= 1):
+        raise ValueError("max_alert_rate must be between 0 and 1.")
+
+    customer_base = config.get("customer_base")
+    if not isinstance(customer_base, int) or customer_base <= 0:
+        raise ValueError("customer_base must be a positive integer.")
+
+    models = config.get("models")
+    if not isinstance(models, list) or len(models) == 0:
+        raise ValueError("models must be a non-empty list.")
+
+    names = []
+    for model_cfg in models:
+        for required_key in ("name", "type", "scaler", "params"):
+            if required_key not in model_cfg:
+                raise ValueError(f"Model config missing required key: {required_key}")
+        names.append(model_cfg["name"])
+
+    if len(set(names)) != len(names):
+        raise ValueError("Model names must be unique.")
+
+    if not isinstance(config.get("run_snapshot"), bool):
+        raise ValueError("run_snapshot must be a boolean.")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description=(
+            "Compare churn classification models, save evaluation artifacts, "
+            "and support a dry-run configuration check."
+        )
+    )
+    parser.add_argument(
+        "--data-path",
+        required=True,
+        help="Path to the input dataset CSV file.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default="./output",
+        help="Directory where all results and plots will be saved.",
+    )
+    parser.add_argument(
+        "--n-folds",
+        type=int,
+        default=5,
+        help="Number of stratified cross-validation folds.",
+    )
+    parser.add_argument(
+        "--random-seed",
+        type=int,
+        default=42,
+        help="Random seed for reproducibility.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate the dataset and configuration without training any models.",
+    )
+    parser.add_argument(
+        "--config-path",
+        default="config.json",
+        help="Optional path to a JSON config file.",
+    )
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        help="Logging level: DEBUG, INFO, WARNING, ERROR, or CRITICAL.",
+    )
+    return parser.parse_args()
+
+
+def build_output_paths(output_dir, run_dir=None, dry_run=False):
+    log_dir = run_dir if run_dir else output_dir
+    log_name = "dry_run.log" if dry_run else "run.log"
+
+    return {
+        "comparison_table": os.path.join(output_dir, "comparison_table.csv"),
+        "pr_curves": os.path.join(output_dir, "pr_curves.png"),
+        "calibration": os.path.join(output_dir, "calibration.png"),
+        "best_model": os.path.join(output_dir, "best_model.joblib"),
+        "experiment_log": os.path.join(output_dir, "experiment_log.csv"),
+        "tree_vs_linear": os.path.join(output_dir, "tree_vs_linear_disagreement.md"),
+        "test_predictions": os.path.join(output_dir, "test_predictions.csv"),
+        "calibration_metrics": os.path.join(output_dir, "calibration_metrics.csv"),
+        "threshold_tuning_csv": os.path.join(output_dir, "threshold_tuning.csv"),
+        "threshold_sweep": os.path.join(output_dir, "threshold_sweep.png"),
+        "threshold_recommendation": os.path.join(output_dir, "threshold_recommendation.md"),
+        "error_analysis": os.path.join(output_dir, "error_analysis.md"),
+        "operating_metrics": os.path.join(output_dir, "operating_metrics.json"),
+        "run_metadata": os.path.join(output_dir, "run_metadata.json"),
+        "data_quality_report": os.path.join(output_dir, "data_quality_report.json"),
+        "run_log": os.path.join(log_dir, log_name),
+    }
+
+
+def setup_logging(log_path, log_level="INFO"):
     ensure_parent_dir(log_path)
     logger = logging.getLogger("model_comparison")
-    logger.setLevel(logging.INFO)
+    logger.setLevel(getattr(logging, log_level.upper()))
     logger.handlers.clear()
 
     formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
@@ -170,13 +368,169 @@ def setup_logging(log_path):
     return logger
 
 
+def validate_data(filepath, logger=None):
+    if not os.path.exists(filepath):
+        raise FileNotFoundError(f"Data file not found: {filepath}")
+
+    df = pd.read_csv(filepath)
+
+    if df.empty:
+        raise ValueError("Dataset is empty.")
+
+    required_cols = NUMERIC_FEATURES + ["churned"]
+    missing_cols = [col for col in required_cols if col not in df.columns]
+    if missing_cols:
+        raise ValueError(f"Missing required columns: {missing_cols}")
+
+    df = df.copy()
+
+    for col in NUMERIC_FEATURES:
+        coerced = pd.to_numeric(df[col], errors="coerce")
+        invalid_mask = coerced.isna() & df[col].notna()
+        if invalid_mask.any():
+            raise ValueError(f"Column '{col}' contains non-numeric values.")
+        df[col] = coerced
+
+    target_coerced = pd.to_numeric(df["churned"], errors="coerce")
+    invalid_target_mask = target_coerced.isna() & df["churned"].notna()
+    if invalid_target_mask.any():
+        raise ValueError("Target column 'churned' contains non-numeric values.")
+    df["churned"] = target_coerced
+
+    if df["churned"].isna().any():
+        raise ValueError("Target column 'churned' contains missing values.")
+
+    unique_targets = set(df["churned"].dropna().astype(int).unique().tolist())
+    if not unique_targets.issubset({0, 1}):
+        raise ValueError("Target column 'churned' must contain only binary values {0, 1}.")
+    df["churned"] = df["churned"].astype(int)
+
+    for col in BINARY_FEATURES:
+        non_missing = set(df[col].dropna().astype(int).unique().tolist())
+        if not non_missing.issubset({0, 1}):
+            raise ValueError(f"Binary feature '{col}' must contain only values in {{0, 1}}.")
+
+    if (df["contract_months"].dropna() <= 0).any():
+        raise ValueError("contract_months must be strictly positive when present.")
+
+    if (df["tenure"].dropna() < 0).any():
+        raise ValueError("tenure cannot be negative.")
+    if (df["monthly_charges"].dropna() < 0).any():
+        raise ValueError("monthly_charges cannot be negative.")
+    if (df["total_charges"].dropna() < 0).any():
+        raise ValueError("total_charges cannot be negative.")
+    if (df["num_support_calls"].dropna() < 0).any():
+        raise ValueError("num_support_calls cannot be negative.")
+
+    class_counts = df["churned"].value_counts().sort_index()
+    min_class_count = int(class_counts.min())
+    duplicate_rows = int(df.duplicated().sum())
+    suspicious_zero_total_charges = int(
+        ((df["tenure"] > 3) & (df["total_charges"] == 0)).sum()
+    )
+
+    missing_by_column = {
+        col: int(count)
+        for col, count in df[required_cols].isna().sum().items()
+    }
+
+    negative_value_counts = {
+        col: int((df[col].dropna() < 0).sum())
+        for col in NUMERIC_FEATURES
+    }
+
+    report = {
+        "rows": int(df.shape[0]),
+        "columns": int(df.shape[1]),
+        "required_columns": required_cols,
+        "class_distribution": {
+            int(label): {
+                "count": int(count),
+                "rate": round(float(count / len(df)), 6),
+            }
+            for label, count in class_counts.items()
+        },
+        "min_class_count": min_class_count,
+        "duplicate_rows": duplicate_rows,
+        "missing_by_column": missing_by_column,
+        "negative_value_counts": negative_value_counts,
+        "suspicious_zero_total_charges_count": suspicious_zero_total_charges,
+    }
+
+    if logger is not None:
+        logger.info(
+            "Loading data from %s (%s rows, %s columns)",
+            filepath,
+            df.shape[0],
+            df.shape[1],
+        )
+        logger.info("Class distribution (churned): %s", report["class_distribution"])
+
+        total_missing_features = int(df[NUMERIC_FEATURES].isna().sum().sum())
+        if total_missing_features > 0:
+            logger.warning(
+                "Numeric feature columns contain %s missing values in total. "
+                "Pipelines will impute them with median values.",
+                total_missing_features,
+            )
+
+        if duplicate_rows > 0:
+            logger.warning("Dataset contains %s duplicated rows.", duplicate_rows)
+
+        if suspicious_zero_total_charges > 0:
+            logger.warning(
+                "Found %s rows with tenure > 3 and total_charges == 0. "
+                "This may indicate data quality issues.",
+                suspicious_zero_total_charges,
+            )
+
+    return df, report
+
+
+def validate_cv_feasibility(df, n_splits):
+    min_class_count = int(df["churned"].value_counts().min())
+    if n_splits > min_class_count:
+        raise ValueError(
+            f"n_splits={n_splits} is too large for the minority class count "
+            f"({min_class_count})."
+        )
+
+
+def log_pipeline_configuration(logger, config, output_paths):
+    model_names = [model_cfg["name"] for model_cfg in config.get("models", [])]
+
+    logger.info("Pipeline configuration:")
+    logger.info("  data_path: %s", config["data_path"])
+    logger.info("  output_dir: %s", config["results_root"])
+    logger.info("  n_folds: %s", config["n_splits"])
+    logger.info("  random_seed: %s", config["random_state"])
+    logger.info("  selection_metric: %s", config["selection_metric"])
+    logger.info("  threshold_selection_strategy: %s", config["threshold_selection_strategy"])
+    logger.info("  recall_target: %s", config["recall_target"])
+    logger.info("  max_alert_rate: %s", config["max_alert_rate"])
+    logger.info("  calibration_bins: %s", config["calibration_bins"])
+    logger.info("  error_analysis_top_n: %s", config["error_analysis_top_n"])
+    logger.info("  models_to_compare: %s", model_names)
+    logger.info("  key_output_paths:")
+    logger.info("    comparison_table: %s", output_paths["comparison_table"])
+    logger.info("    pr_curves: %s", output_paths["pr_curves"])
+    logger.info("    calibration: %s", output_paths["calibration"])
+    logger.info("    best_model: %s", output_paths["best_model"])
+    logger.info("    experiment_log: %s", output_paths["experiment_log"])
+    logger.info("    threshold_sweep: %s", output_paths["threshold_sweep"])
+    logger.info("    threshold_recommendation: %s", output_paths["threshold_recommendation"])
+    logger.info("    operating_metrics: %s", output_paths["operating_metrics"])
+    logger.info("    error_analysis: %s", output_paths["error_analysis"])
+
+
 def build_pipeline(model_type, scaler_name, params):
-    """Build one pipeline from config."""
-    scaler = StandardScaler() if scaler_name == "standard" else "passthrough"
+    steps = [("imputer", SimpleImputer(strategy="median"))]
 
     if model_type == "dummy":
         model = DummyClassifier(**params)
     elif model_type == "logistic_regression":
+        if scaler_name == "standard":
+            steps.append(("scaler", StandardScaler()))
         model = LogisticRegression(**params)
     elif model_type == "decision_tree":
         model = DecisionTreeClassifier(**params)
@@ -185,43 +539,11 @@ def build_pipeline(model_type, scaler_name, params):
     else:
         raise ValueError(f"Unsupported model type: {model_type}")
 
-    return Pipeline([
-        ("scaler", scaler),
-        ("model", model),
-    ])
-
-
-def get_top3_models_by_test_pr_auc(models, X_test, y_test):
-    """Return the top 3 fitted models by test-set PR-AUC."""
-    pr_auc_scores = {}
-    for name, model in models.items():
-        y_proba = model.predict_proba(X_test)[:, 1]
-        pr_auc_scores[name] = average_precision_score(y_test, y_proba)
-    return sorted(pr_auc_scores.items(), key=lambda x: x[1], reverse=True)[:3]
-
-
-def compute_ece(y_true, y_prob, n_bins=10):
-    """Compute Expected Calibration Error (ECE)."""
-    y_true = np.asarray(y_true)
-    y_prob = np.asarray(y_prob)
-    bins = np.linspace(0.0, 1.0, n_bins + 1)
-    bin_ids = np.digitize(y_prob, bins) - 1
-    ece = 0.0
-
-    for bin_idx in range(n_bins):
-        mask = bin_ids == bin_idx
-        if not np.any(mask):
-            continue
-        bin_conf = y_prob[mask].mean()
-        bin_acc = y_true[mask].mean()
-        ece += np.abs(bin_acc - bin_conf) * mask.mean()
-
-    return float(ece)
+    steps.append(("model", model))
+    return Pipeline(steps)
 
 
 class ModelSelector:
-    """Small helper to fit, rank, and retrieve model configurations."""
-
     def __init__(self, models, selection_metric="pr_auc_mean"):
         self.models = models
         self.selection_metric = selection_metric
@@ -234,35 +556,24 @@ class ModelSelector:
         return fitted_models
 
     def select_best_from_results(self, results_df):
-        ranked = results_df.sort_values(self.selection_metric, ascending=False).reset_index(drop=True)
+        ranked = results_df.sort_values(
+            self.selection_metric,
+            ascending=False
+        ).reset_index(drop=True)
         best_row = ranked.iloc[0]
         return best_row["model"], best_row
 
-    def top_n_by_test_pr_auc(self, fitted_models, X_test, y_test, n=3):
-        scores = get_top3_models_by_test_pr_auc(fitted_models, X_test, y_test)
-        return scores[:n]
+    def top_n_from_results(self, results_df, n=3):
+        ranked = results_df.sort_values(
+            self.selection_metric,
+            ascending=False
+        ).reset_index(drop=True)
+        return ranked.head(n)["model"].tolist()
 
 
-def load_and_preprocess(filepath="data/telecom_churn.csv", random_state=42):
-    """Load the Petra Telecom dataset and split into train/test sets.
-
-    Uses an 80/20 stratified split. Features are the 8 NUMERIC_FEATURES
-    columns. Target is `churned`.
-
-    Args:
-        filepath: Path to telecom_churn.csv.
-        random_state: Random seed for reproducible split.
-
-    Returns:
-        Tuple (X_train, X_test, y_train, y_test) where X contains only
-        NUMERIC_FEATURES and y is the `churned` column.
-    """
-    df = pd.read_csv(filepath)
-
-    required_cols = NUMERIC_FEATURES + ["churned"]
-    missing_cols = [col for col in required_cols if col not in df.columns]
-    if missing_cols:
-        raise ValueError(f"Missing required columns: {missing_cols}")
+def load_and_preprocess(filepath="data/telecom_churn.csv", random_state=42, df=None):
+    if df is None:
+        df, _ = validate_data(filepath)
 
     X = df[NUMERIC_FEATURES]
     y = df["churned"]
@@ -274,34 +585,15 @@ def load_and_preprocess(filepath="data/telecom_churn.csv", random_state=42):
         random_state=random_state,
         stratify=y,
     )
-
     return X_train, X_test, y_train, y_test
 
 
 def define_models(config=None):
-    """Define 6 model configurations for comparison.
-
-    The pattern is deliberate: a default vs class_weight='balanced' pair
-    at BOTH the linear and ensemble family levels. This lets you observe
-    the class_weight effect at two levels of model complexity.
-
-    The 6 configurations:
-      1. DummyClassifier(strategy='most_frequent') — baseline
-      2. LogisticRegression(max_iter=1000) — linear default (needs scaling)
-      3. LogisticRegression(class_weight='balanced', max_iter=1000) — linear balanced (needs scaling)
-      4. DecisionTreeClassifier(max_depth=5) — tree baseline
-      5. RandomForestClassifier(n_estimators=100, max_depth=10) — ensemble default
-      6. RandomForestClassifier(n_estimators=100, max_depth=10, class_weight='balanced') — ensemble balanced
-
-    LR variants require StandardScaler preprocessing; tree-based models
-    do not. Use sklearn Pipeline to pair each model with its preprocessing.
-
-    Returns:
-        Dict of {name: sklearn.pipeline.Pipeline} with 6 entries.
-        Names: 'Dummy', 'LR_default', 'LR_balanced', 'DT_depth5',
-               'RF_default', 'RF_balanced'.
-    """
-    model_configs = DEFAULT_CONFIG["models"] if config is None else config.get("models", DEFAULT_CONFIG["models"])
+    model_configs = (
+        DEFAULT_CONFIG["models"]
+        if config is None
+        else config.get("models", DEFAULT_CONFIG["models"])
+    )
 
     models = {}
     for model_cfg in model_configs:
@@ -310,30 +602,10 @@ def define_models(config=None):
             scaler_name=model_cfg.get("scaler", "passthrough"),
             params=model_cfg.get("params", {}),
         )
-
     return models
 
 
 def run_cv_comparison(models, X, y, n_splits=5, random_state=42):
-    """Run 5-fold stratified cross-validation on all models.
-
-    For each model, compute mean and std of: accuracy, precision, recall,
-    F1, and PR-AUC across folds. PR-AUC uses predict_proba — it is a
-    threshold-independent ranking metric.
-
-    Args:
-        models: Dict of {name: Pipeline} from define_models().
-        X: Feature DataFrame.
-        y: Target Series.
-        n_splits: Number of CV folds.
-        random_state: Random seed for StratifiedKFold.
-
-    Returns:
-        DataFrame with columns: model, accuracy_mean, accuracy_std,
-        precision_mean, precision_std, recall_mean, recall_std,
-        f1_mean, f1_std, pr_auc_mean, pr_auc_std.
-        One row per model (6 rows total).
-    """
     skf = StratifiedKFold(
         n_splits=n_splits,
         shuffle=True,
@@ -357,10 +629,11 @@ def run_cv_comparison(models, X, y, n_splits=5, random_state=42):
             y_train_fold = y.iloc[train_idx]
             y_val_fold = y.iloc[val_idx]
 
-            pipeline.fit(X_train_fold, y_train_fold)
+            model = clone(pipeline)
+            model.fit(X_train_fold, y_train_fold)
 
-            y_pred = pipeline.predict(X_val_fold)
-            y_proba = pipeline.predict_proba(X_val_fold)[:, 1]
+            y_pred = model.predict(X_val_fold)
+            y_proba = model.predict_proba(X_val_fold)[:, 1]
 
             fold_metrics["accuracy"].append(accuracy_score(y_val_fold, y_pred))
             fold_metrics["precision"].append(
@@ -383,36 +656,21 @@ def run_cv_comparison(models, X, y, n_splits=5, random_state=42):
         results.append(row)
 
     results_df = pd.DataFrame(results)
-    return results_df.sort_values("pr_auc_mean", ascending=False).reset_index(drop=True)
+    results_df = results_df.sort_values("pr_auc_mean", ascending=False).reset_index(drop=True)
+    results_df.insert(0, "rank", np.arange(1, len(results_df) + 1))
+    return results_df
 
 
-def save_comparison_table(results_df, output_path="results/comparison_table.csv"):
-    """Save the comparison table to CSV.
-
-    Args:
-        results_df: DataFrame from run_cv_comparison().
-        output_path: Destination path.
-    """
+def save_comparison_table(results_df, output_path):
     ensure_parent_dir(output_path)
     results_df.to_csv(output_path, index=False)
 
 
-def plot_pr_curves_top3(models, X_test, y_test, output_path="results/pr_curves.png"):
-    """Plot PR curves for the top 3 models (by PR-AUC) on one axes and save.
-
-    Args:
-        models: Dict of {name: fitted Pipeline} — must already be fitted.
-        X_test: Test features.
-        y_test: Test labels.
-        output_path: Destination path for the PNG.
-    """
-    top3 = get_top3_models_by_test_pr_auc(models, X_test, y_test)
-
+def plot_pr_curves_top3(models, top_model_names, X_test, y_test, output_path):
     ensure_parent_dir(output_path)
 
     fig, ax = plt.subplots(figsize=(8, 6))
-
-    for name, _ in top3:
+    for name in top_model_names:
         PrecisionRecallDisplay.from_estimator(
             models[name],
             X_test,
@@ -421,67 +679,38 @@ def plot_pr_curves_top3(models, X_test, y_test, output_path="results/pr_curves.p
             name=name,
         )
 
-    ax.set_title("Precision-Recall Curves for Top 3 Models")
+    ax.set_title("Precision-Recall Curves for Top Models")
     fig.tight_layout()
     fig.savefig(output_path)
     plt.close(fig)
 
 
-def plot_calibration_top3(models, X_test, y_test, output_path="results/calibration.png"):
-    """Plot calibration curves for the top 3 models and save.
-
-    Uses CalibrationDisplay.from_estimator.
-
-    Args:
-        models: Dict of {name: fitted Pipeline} — must already be fitted.
-        X_test: Test features.
-        y_test: Test labels.
-        output_path: Destination path for the PNG.
-    """
-    top3 = get_top3_models_by_test_pr_auc(models, X_test, y_test)
-
+def plot_calibration_top3(models, top_model_names, X_test, y_test, output_path, n_bins=10):
     ensure_parent_dir(output_path)
 
     fig, ax = plt.subplots(figsize=(8, 6))
-
-    for name, _ in top3:
+    for name in top_model_names:
         CalibrationDisplay.from_estimator(
             models[name],
             X_test,
             y_test,
-            n_bins=10,
+            n_bins=n_bins,
             ax=ax,
             name=name,
         )
 
-    ax.set_title("Calibration Curves for Top 3 Models")
+    ax.set_title("Calibration Curves for Top Models")
     fig.tight_layout()
     fig.savefig(output_path)
     plt.close(fig)
 
 
-def save_best_model(best_model, output_path="results/best_model.joblib"):
-    """Persist the best model to disk with joblib.
-
-    Args:
-        best_model: A fitted sklearn Pipeline.
-        output_path: Destination path.
-    """
+def save_best_model(best_model, output_path):
     ensure_parent_dir(output_path)
     dump(best_model, output_path)
 
 
-def log_experiment(results_df, output_path="results/experiment_log.csv"):
-    """Log all model results with timestamps.
-
-    Produces a CSV with columns: model_name, accuracy, precision, recall,
-    f1, pr_auc, timestamp. One row per model. The timestamp records WHEN
-    the experiment was run (ISO format).
-
-    Args:
-        results_df: DataFrame from run_cv_comparison().
-        output_path: Destination path.
-    """
+def log_experiment(results_df, output_path):
     timestamp = datetime.now().isoformat()
 
     log_df = pd.DataFrame({
@@ -498,9 +727,251 @@ def log_experiment(results_df, output_path="results/experiment_log.csv"):
     log_df.to_csv(output_path, index=False)
 
 
-def find_tree_vs_linear_disagreement(rf_model, lr_model, X_test, y_test,
-                                     feature_names, min_diff=0.15):
-    """Find ONE test sample where RF and LR predicted probabilities differ most."""
+def generate_oof_probabilities(pipeline, X, y, n_splits=5, random_state=42):
+    skf = StratifiedKFold(
+        n_splits=n_splits,
+        shuffle=True,
+        random_state=random_state,
+    )
+
+    oof_probabilities = np.zeros(len(y), dtype=float)
+
+    for train_idx, val_idx in skf.split(X, y):
+        X_train_fold = X.iloc[train_idx]
+        X_val_fold = X.iloc[val_idx]
+        y_train_fold = y.iloc[train_idx]
+
+        model = clone(pipeline)
+        model.fit(X_train_fold, y_train_fold)
+        oof_probabilities[val_idx] = model.predict_proba(X_val_fold)[:, 1]
+
+    return oof_probabilities
+
+
+def compute_threshold_table(y_true, y_prob, thresholds, customer_base=10000):
+    rows = []
+
+    for threshold in thresholds:
+        y_pred = (y_prob >= threshold).astype(int)
+        predicted_positive_count = int(y_pred.sum())
+        alert_rate = float(y_pred.mean())
+
+        rows.append({
+            "threshold": float(threshold),
+            "precision": float(precision_score(y_true, y_pred, zero_division=0)),
+            "recall": float(recall_score(y_true, y_pred, zero_division=0)),
+            "f1": float(f1_score(y_true, y_pred, zero_division=0)),
+            "predicted_positive_count": predicted_positive_count,
+            "alert_rate": alert_rate,
+            "alerts_per_1000": alert_rate * 1000.0,
+            "expected_alerts_per_customer_base": alert_rate * customer_base,
+        })
+
+    return pd.DataFrame(rows)
+
+
+def select_threshold_candidates(
+    threshold_df,
+    strategy="best_f1",
+    recall_target=None,
+    max_alert_rate=None,
+):
+    best_f1 = (
+        threshold_df.sort_values(
+            ["f1", "recall", "precision", "threshold"],
+            ascending=[False, False, False, False],
+        )
+        .iloc[0]
+        .to_dict()
+    )
+
+    recall_target_candidate = None
+    if recall_target is not None:
+        eligible = threshold_df[threshold_df["recall"] >= recall_target].copy()
+        if not eligible.empty:
+            recall_target_candidate = (
+                eligible.sort_values(
+                    ["precision", "f1", "threshold"],
+                    ascending=[False, False, False],
+                )
+                .iloc[0]
+                .to_dict()
+            )
+
+    capacity_candidate = None
+    if max_alert_rate is not None:
+        eligible = threshold_df[threshold_df["alert_rate"] <= max_alert_rate].copy()
+        if not eligible.empty:
+            capacity_candidate = (
+                eligible.sort_values(
+                    ["recall", "f1", "precision", "threshold"],
+                    ascending=[False, False, False, False],
+                )
+                .iloc[0]
+                .to_dict()
+            )
+
+    if strategy == "best_f1":
+        selected = best_f1
+        selected_reason = "Selected the threshold that maximized out-of-fold F1."
+    elif strategy == "target_recall_with_best_precision":
+        selected = recall_target_candidate if recall_target_candidate is not None else best_f1
+        selected_reason = (
+            f"Selected the highest-precision threshold achieving recall >= {recall_target:.2f}."
+            if recall_target_candidate is not None
+            else "No threshold achieved the recall target, so the best-F1 threshold was used."
+        )
+    elif strategy == "max_recall_at_or_below_alert_rate":
+        selected = capacity_candidate if capacity_candidate is not None else best_f1
+        selected_reason = (
+            f"Selected the highest-recall threshold with alert_rate <= {max_alert_rate:.4f}."
+            if capacity_candidate is not None
+            else "No threshold satisfied the alert-rate constraint, so the best-F1 threshold was used."
+        )
+    else:
+        raise ValueError(f"Unsupported threshold selection strategy: {strategy}")
+
+    return selected, {
+        "selected": selected,
+        "selected_reason": selected_reason,
+        "best_f1": best_f1,
+        "recall_target_candidate": recall_target_candidate,
+        "capacity_candidate": capacity_candidate,
+    }
+
+
+def format_threshold_candidate(candidate):
+    if candidate is None:
+        return "- Not available"
+
+    return (
+        f"- threshold={candidate['threshold']:.2f}, "
+        f"precision={candidate['precision']:.3f}, "
+        f"recall={candidate['recall']:.3f}, "
+        f"f1={candidate['f1']:.3f}, "
+        f"alert_rate={candidate['alert_rate']:.3f}, "
+        f"alerts_per_1000={candidate['alerts_per_1000']:.1f}"
+    )
+
+
+def save_threshold_recommendation(
+    best_model_name,
+    strategy,
+    recall_target,
+    max_alert_rate,
+    threshold_candidates,
+    output_path,
+):
+    lines = [
+        "# Threshold Recommendation",
+        "",
+        f"- **Model:** {best_model_name}",
+        f"- **Selection strategy:** {strategy}",
+        f"- **Selection basis:** out-of-fold training predictions",
+        f"- **Recall target:** {recall_target}",
+        f"- **Max alert rate:** {max_alert_rate}",
+        "",
+        "## Selected Operating Threshold",
+        "",
+        format_threshold_candidate(threshold_candidates["selected"]),
+        "",
+        threshold_candidates["selected_reason"],
+        "",
+        "## Alternative Candidates",
+        "",
+        "**Best F1 candidate**",
+        format_threshold_candidate(threshold_candidates["best_f1"]),
+        "",
+        "**Recall-target candidate**",
+        format_threshold_candidate(threshold_candidates["recall_target_candidate"]),
+        "",
+        "**Capacity-constrained candidate**",
+        format_threshold_candidate(threshold_candidates["capacity_candidate"]),
+        "",
+        "The selected threshold is chosen on training data only. "
+        "The held-out test set remains reserved for final evaluation.",
+    ]
+
+    ensure_parent_dir(output_path)
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+
+def plot_threshold_sweep(
+    threshold_df,
+    selected_threshold,
+    output_path,
+    max_alert_rate=None,
+):
+    ensure_parent_dir(output_path)
+
+    fig, ax1 = plt.subplots(figsize=(10, 6))
+
+    ax1.plot(threshold_df["threshold"], threshold_df["precision"], marker="o", label="Precision")
+    ax1.plot(threshold_df["threshold"], threshold_df["recall"], marker="o", label="Recall")
+    ax1.plot(threshold_df["threshold"], threshold_df["f1"], marker="o", label="F1")
+    ax1.axvline(selected_threshold, linestyle="--", label=f"Selected threshold ({selected_threshold:.2f})")
+    ax1.set_xlabel("Threshold")
+    ax1.set_ylabel("Score")
+    ax1.set_ylim(0, 1.05)
+
+    ax2 = ax1.twinx()
+    ax2.plot(
+        threshold_df["threshold"],
+        threshold_df["alerts_per_1000"],
+        marker="s",
+        linestyle="--",
+        label="Alerts per 1,000",
+    )
+    ax2.set_ylabel("Alerts per 1,000 customers")
+
+    if max_alert_rate is not None:
+        ax2.axhline(
+            max_alert_rate * 1000.0,
+            linestyle=":",
+            label=f"Max alerts ({max_alert_rate * 1000.0:.1f} / 1,000)",
+        )
+
+    handles1, labels1 = ax1.get_legend_handles_labels()
+    handles2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(handles1 + handles2, labels1 + labels2, loc="best")
+
+    ax1.set_title("Threshold Selection on Training OOF Predictions")
+    fig.tight_layout()
+    fig.savefig(output_path)
+    plt.close(fig)
+
+
+def evaluate_operating_point(model, X, y, threshold):
+    y_proba = model.predict_proba(X)[:, 1]
+    y_pred = (y_proba >= threshold).astype(int)
+    tn, fp, fn, tp = confusion_matrix(y, y_pred, labels=[0, 1]).ravel()
+
+    return {
+        "threshold": float(threshold),
+        "accuracy": float(accuracy_score(y, y_pred)),
+        "precision": float(precision_score(y, y_pred, zero_division=0)),
+        "recall": float(recall_score(y, y_pred, zero_division=0)),
+        "f1": float(f1_score(y, y_pred, zero_division=0)),
+        "pr_auc": float(average_precision_score(y, y_proba)),
+        "brier_score": float(brier_score_loss(y, y_proba)),
+        "predicted_positive_count": int(y_pred.sum()),
+        "alert_rate": float(y_pred.mean()),
+        "tn": int(tn),
+        "fp": int(fp),
+        "fn": int(fn),
+        "tp": int(tp),
+    }
+
+
+def find_tree_vs_linear_disagreement(
+    rf_model,
+    lr_model,
+    X_test,
+    y_test,
+    feature_names,
+    min_diff=0.15,
+):
     rf_proba_all = rf_model.predict_proba(X_test)[:, 1]
     lr_proba_all = lr_model.predict_proba(X_test)[:, 1]
 
@@ -516,7 +987,11 @@ def find_tree_vs_linear_disagreement(rf_model, lr_model, X_test, y_test,
     sample_row = X_test.iloc[max_pos]
 
     feature_values = {
-        feature: sample_row[feature].item() if hasattr(sample_row[feature], "item") else sample_row[feature]
+        feature: (
+            sample_row[feature].item()
+            if hasattr(sample_row[feature], "item")
+            else sample_row[feature]
+        )
         for feature in feature_names
     }
 
@@ -533,8 +1008,50 @@ def find_tree_vs_linear_disagreement(rf_model, lr_model, X_test, y_test,
     }
 
 
-def save_test_predictions(models, X_test, y_test, output_path="results/test_predictions.csv", threshold=0.5):
-    """Save per-row test predictions for every fitted model."""
+def save_tree_vs_linear_disagreement(disagreement, output_path):
+    md_lines = [
+        "# Tree vs. Linear Disagreement Analysis",
+        "",
+        "## Sample Details",
+        "",
+        f"- **Test-set index:** {disagreement['sample_idx']}",
+        f"- **True label:** {disagreement['true_label']}",
+        f"- **RF predicted P(churn=1):** {disagreement['rf_proba']:.4f}",
+        f"- **LR predicted P(churn=1):** {disagreement['lr_proba']:.4f}",
+        f"- **Probability difference:** {disagreement['prob_diff']:.4f}",
+        "",
+        "## Feature Values",
+        "",
+    ]
+    for feat, val in disagreement["feature_values"].items():
+        md_lines.append(f"- **{feat}:** {val}")
+
+    md_lines.extend([
+        "",
+        "## Structural Explanation",
+        "The disagreement is likely driven by a threshold-style pattern around "
+        "`contract_months = 1`, which the random forest can treat as a strong churn "
+        "signal when combined with the rest of the feature profile. In this sample, "
+        "the tree model assigned a much higher churn probability than logistic "
+        "regression, suggesting that the tree captured a rule-like interaction that "
+        "the linear model smoothed out through additive feature effects. This also "
+        "matches the broader pattern in churn modeling where tree-based models can "
+        "react more strongly to split points and feature interactions than linear models.",
+    ])
+
+    ensure_parent_dir(output_path)
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(md_lines))
+
+
+def save_test_predictions(
+    models,
+    best_model_name,
+    selected_threshold,
+    X_test,
+    y_test,
+    output_path,
+):
     pred_df = pd.DataFrame({
         "sample_idx": X_test.index,
         "true_label": y_test.values,
@@ -543,22 +1060,25 @@ def save_test_predictions(models, X_test, y_test, output_path="results/test_pred
     for name, model in models.items():
         y_proba = model.predict_proba(X_test)[:, 1]
         pred_df[f"{name}_proba"] = y_proba
-        pred_df[f"{name}_pred"] = (y_proba >= threshold).astype(int)
+        pred_df[f"{name}_pred_0_50"] = (y_proba >= 0.5).astype(int)
+
+    best_probs = models[best_model_name].predict_proba(X_test)[:, 1]
+    pred_df["selected_threshold"] = float(selected_threshold)
+    pred_df[f"{best_model_name}_pred_selected"] = (best_probs >= selected_threshold).astype(int)
 
     ensure_parent_dir(output_path)
     pred_df.to_csv(output_path, index=False)
     return pred_df
 
 
-def save_calibration_metrics(models, X_test, y_test, output_path="results/calibration_metrics.csv", n_bins=10):
-    """Save numeric calibration metrics for all fitted models."""
+def save_calibration_metrics(models, X_test, y_test, output_path, n_bins=10):
     rows = []
     for name, model in models.items():
         y_proba = model.predict_proba(X_test)[:, 1]
         rows.append({
             "model": name,
             "brier_score": float(brier_score_loss(y_test, y_proba)),
-            "ece": compute_ece(y_test, y_proba, n_bins=n_bins),
+            "ece": float(compute_ece(y_test, y_proba, n_bins=n_bins)),
             "pr_auc_test": float(average_precision_score(y_test, y_proba)),
         })
 
@@ -568,51 +1088,33 @@ def save_calibration_metrics(models, X_test, y_test, output_path="results/calibr
     return metrics_df
 
 
-def run_threshold_tuning(best_model, X_test, y_test, thresholds=None,
-                         output_csv_path="results/threshold_tuning.csv",
-                         output_plot_path="results/threshold_sweep.png"):
-    """Sweep thresholds for the chosen model and save metrics + plot."""
-    if thresholds is None:
-        thresholds = [round(float(x), 2) for x in np.arange(0.10, 0.91, 0.05)]
+def compute_ece(y_true, y_prob, n_bins=10):
+    y_true = np.asarray(y_true)
+    y_prob = np.asarray(y_prob)
+    bins = np.linspace(0.0, 1.0, n_bins + 1)
+    bin_ids = np.digitize(y_prob, bins) - 1
+    ece = 0.0
 
-    y_proba = best_model.predict_proba(X_test)[:, 1]
-    rows = []
+    for bin_idx in range(n_bins):
+        mask = bin_ids == bin_idx
+        if not np.any(mask):
+            continue
+        bin_conf = y_prob[mask].mean()
+        bin_acc = y_true[mask].mean()
+        ece += np.abs(bin_acc - bin_conf) * mask.mean()
 
-    for threshold in thresholds:
-        y_pred = (y_proba >= threshold).astype(int)
-        rows.append({
-            "threshold": threshold,
-            "precision": precision_score(y_test, y_pred, zero_division=0),
-            "recall": recall_score(y_test, y_pred, zero_division=0),
-            "f1": f1_score(y_test, y_pred, zero_division=0),
-            "predicted_positive_count": int(y_pred.sum()),
-            "alert_rate": float(y_pred.mean()),
-        })
-
-    threshold_df = pd.DataFrame(rows)
-    ensure_parent_dir(output_csv_path)
-    threshold_df.to_csv(output_csv_path, index=False)
-
-    ensure_parent_dir(output_plot_path)
-    fig, ax = plt.subplots(figsize=(8, 6))
-    ax.plot(threshold_df["threshold"], threshold_df["precision"], marker="o", label="Precision")
-    ax.plot(threshold_df["threshold"], threshold_df["recall"], marker="o", label="Recall")
-    ax.plot(threshold_df["threshold"], threshold_df["f1"], marker="o", label="F1")
-    ax.set_xlabel("Threshold")
-    ax.set_ylabel("Score")
-    ax.set_title("Threshold Tuning for Best Model")
-    ax.legend()
-    fig.tight_layout()
-    fig.savefig(output_plot_path)
-    plt.close(fig)
-
-    return threshold_df
+    return float(ece)
 
 
-def save_error_analysis(best_model, X_test, y_test, feature_names,
-                        output_path="results/error_analysis.md",
-                        threshold=0.5, top_n=10):
-    """Write a markdown error analysis for the best model."""
+def save_error_analysis(
+    best_model,
+    X_test,
+    y_test,
+    feature_names,
+    output_path,
+    threshold,
+    top_n=10,
+):
     y_proba = best_model.predict_proba(X_test)[:, 1]
     y_pred = (y_proba >= threshold).astype(int)
 
@@ -633,8 +1135,14 @@ def save_error_analysis(best_model, X_test, y_test, feature_names,
 
     analysis_df["error_type"] = analysis_df.apply(label_error, axis=1)
 
-    fp_df = analysis_df[analysis_df["error_type"] == "FP"].sort_values("predicted_proba", ascending=False)
-    fn_df = analysis_df[analysis_df["error_type"] == "FN"].sort_values("predicted_proba", ascending=True)
+    fp_df = analysis_df[analysis_df["error_type"] == "FP"].sort_values(
+        "predicted_proba",
+        ascending=False,
+    )
+    fn_df = analysis_df[analysis_df["error_type"] == "FN"].sort_values(
+        "predicted_proba",
+        ascending=True,
+    )
 
     lines = [
         "# Error Analysis",
@@ -653,7 +1161,8 @@ def save_error_analysis(best_model, X_test, y_test, feature_names,
     else:
         for _, row in fp_df.head(top_n).iterrows():
             lines.append(
-                f"- **sample_idx={int(row['sample_idx'])}** | proba={row['predicted_proba']:.4f} | "
+                f"- **sample_idx={int(row['sample_idx'])}** | "
+                f"proba={row['predicted_proba']:.4f} | "
                 + ", ".join([f"{feat}={row[feat]}" for feat in feature_names])
             )
 
@@ -668,7 +1177,8 @@ def save_error_analysis(best_model, X_test, y_test, feature_names,
     else:
         for _, row in fn_df.head(top_n).iterrows():
             lines.append(
-                f"- **sample_idx={int(row['sample_idx'])}** | proba={row['predicted_proba']:.4f} | "
+                f"- **sample_idx={int(row['sample_idx'])}** | "
+                f"proba={row['predicted_proba']:.4f} | "
                 + ", ".join([f"{feat}={row[feat]}" for feat in feature_names])
             )
 
@@ -679,79 +1189,82 @@ def save_error_analysis(best_model, X_test, y_test, feature_names,
     return analysis_df
 
 
-def save_run_metadata(config, best_name, run_dir, output_path):
-    """Save run metadata for reproducibility."""
+def save_run_metadata(
+    config,
+    best_name,
+    selected_threshold,
+    run_dir,
+    data_quality_report,
+    threshold_candidates,
+    operating_metrics,
+    output_path,
+):
     metadata = {
         "run_dir": run_dir,
         "saved_at": datetime.now().isoformat(),
         "best_model_name": best_name,
+        "selected_threshold": float(selected_threshold),
         "selection_metric": config["selection_metric"],
+        "threshold_selection_strategy": config["threshold_selection_strategy"],
+        "data_quality_report": data_quality_report,
+        "threshold_candidates": threshold_candidates,
+        "operating_metrics": operating_metrics,
         "config": config,
     }
-    ensure_parent_dir(output_path)
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(metadata, f, indent=2)
+    save_json(metadata, output_path)
 
 
 def copy_outputs_to_run_dir(source_paths, run_dir):
-    """Copy canonical outputs into the timestamped run folder."""
     os.makedirs(run_dir, exist_ok=True)
     for src in source_paths:
         if os.path.exists(src):
             dst = os.path.join(run_dir, os.path.basename(src))
-            shutil.copy2(src, dst)
+            if os.path.abspath(src) != os.path.abspath(dst):
+                shutil.copy2(src, dst)
 
 
-def main():
-    """Orchestrate all 9 integration tasks. Run with: python model_comparison.py"""
-    config = load_config()
-    results_root = config["results_root"]
-    os.makedirs(results_root, exist_ok=True)
+def run_dry_run(logger, config, output_paths):
+    df, data_quality_report = validate_data(config["data_path"], logger=logger)
+    validate_cv_feasibility(df, config["n_splits"])
+    models = define_models(config=config)
 
-    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = os.path.join(results_root, "runs", run_id)
-    logger = setup_logging(os.path.join(run_dir, "run.log"))
+    if not models:
+        raise ValueError("No model configurations were defined.")
 
-    logger.info("Loaded configuration.")
-    logger.info("Run directory: %s", run_dir)
-
-    # Canonical task output paths (kept compatible with the original assignment structure)
-    comparison_table_path = os.path.join(results_root, "comparison_table.csv")
-    pr_curve_path = os.path.join(results_root, "pr_curves.png")
-    calibration_plot_path = os.path.join(results_root, "calibration.png")
-    best_model_path = os.path.join(results_root, "best_model.joblib")
-    experiment_log_path = os.path.join(results_root, "experiment_log.csv")
-    disagreement_md_path = os.path.join(results_root, "tree_vs_linear_disagreement.md")
-
-    # Enhanced analysis outputs
-    test_predictions_path = os.path.join(results_root, "test_predictions.csv")
-    calibration_metrics_path = os.path.join(results_root, "calibration_metrics.csv")
-    threshold_tuning_csv_path = os.path.join(results_root, "threshold_tuning.csv")
-    threshold_tuning_plot_path = os.path.join(results_root, "threshold_sweep.png")
-    error_analysis_path = os.path.join(results_root, "error_analysis.md")
-    metadata_path = os.path.join(results_root, "run_metadata.json")
-
-    # Task 1: Load + split
-    result = load_and_preprocess(config["data_path"], random_state=config["random_state"])
-    if not result:
-        logger.error("load_and_preprocess not implemented. Exiting.")
-        return
-    X_train, X_test, y_train, y_test = result
+    logger.info("%s model configurations defined: %s", len(models), list(models.keys()))
+    log_pipeline_configuration(logger, config, output_paths)
+    save_json(data_quality_report, output_paths["data_quality_report"])
     logger.info(
-        "Data: %s train, %s test, churn rate: %.2f%%",
+        "Dry run completed successfully. Data validated and configuration checked. "
+        "No models were trained."
+    )
+    return 0
+
+
+def run_full_pipeline(logger, config, output_paths, run_dir):
+    df, data_quality_report = validate_data(config["data_path"], logger=logger)
+    validate_cv_feasibility(df, config["n_splits"])
+    save_json(data_quality_report, output_paths["data_quality_report"])
+
+    models = define_models(config=config)
+    if not models:
+        raise ValueError("No model configurations were defined.")
+
+    logger.info("%s model configurations defined: %s", len(models), list(models.keys()))
+    log_pipeline_configuration(logger, config, output_paths)
+
+    X_train, X_test, y_train, y_test = load_and_preprocess(
+        config["data_path"],
+        random_state=config["random_state"],
+        df=df,
+    )
+    logger.info(
+        "Data split complete: %s train, %s test, churn rate: %.2f%%",
         len(X_train),
         len(X_test),
         y_train.mean() * 100,
     )
 
-    # Task 2: Define models
-    models = define_models(config=config)
-    if not models:
-        logger.error("define_models not implemented. Exiting.")
-        return
-    logger.info("%s model configurations defined: %s", len(models), list(models.keys()))
-
-    # Task 3: Cross-validation comparison
     results_df = run_cv_comparison(
         models,
         X_train,
@@ -759,150 +1272,239 @@ def main():
         n_splits=config["n_splits"],
         random_state=config["random_state"],
     )
-    if results_df is None:
-        logger.error("run_cv_comparison not implemented. Exiting.")
-        return
-    logger.info("=== Model Comparison Table (5-fold CV) ===")
+    logger.info("=== Model Comparison Table (CV) ===")
     logger.info("\n%s", results_df.to_string(index=False))
+    save_comparison_table(results_df, output_paths["comparison_table"])
+    log_experiment(results_df, output_paths["experiment_log"])
 
-    # Task 4: Save comparison table
-    save_comparison_table(results_df, output_path=comparison_table_path)
-
-    # Fit all models on full training set for plots + persistence
     selector = ModelSelector(models, selection_metric=config["selection_metric"])
-    fitted_models = selector.fit_all(X_train, y_train)
-
-    # Task 5: PR curves (top 3)
-    plot_pr_curves_top3(fitted_models, X_test, y_test, output_path=pr_curve_path)
-
-    # Task 6: Calibration plot (top 3)
-    plot_calibration_top3(fitted_models, X_test, y_test, output_path=calibration_plot_path)
-
-    # Task 7: Save best model
     best_name, _ = selector.select_best_from_results(results_df)
-    logger.info("Best model by %s: %s", config["selection_metric"], best_name)
-    save_best_model(fitted_models[best_name], output_path=best_model_path)
+    top_model_names = selector.top_n_from_results(results_df, n=3)
+    best_pipeline_template = models[best_name]
 
-    # Task 8: Experiment log
-    log_experiment(results_df, output_path=experiment_log_path)
-
-    # Task 9: Tree-vs-linear disagreement
-    rf_pipeline = fitted_models["RF_default"]
-    lr_pipeline = fitted_models["LR_default"]
-    disagreement = find_tree_vs_linear_disagreement(
-        rf_pipeline, lr_pipeline, X_test, y_test, NUMERIC_FEATURES
+    oof_probabilities = generate_oof_probabilities(
+        best_pipeline_template,
+        X_train,
+        y_train,
+        n_splits=config["n_splits"],
+        random_state=config["random_state"],
     )
-    if disagreement:
-        logger.info(
-            "--- Tree-vs-linear disagreement (sample idx=%s) ---",
-            disagreement["sample_idx"],
-        )
-        logger.info(
-            "RF P(churn=1)=%.3f | LR P(churn=1)=%.3f | |diff|=%.3f | true label=%s",
-            disagreement["rf_proba"],
-            disagreement["lr_proba"],
-            disagreement["prob_diff"],
-            disagreement["true_label"],
-        )
 
-        md_lines = [
-            "# Tree vs. Linear Disagreement Analysis",
-            "",
-            "## Sample Details",
-            "",
-            f"- **Test-set index:** {disagreement['sample_idx']}",
-            f"- **True label:** {disagreement['true_label']}",
-            f"- **RF predicted P(churn=1):** {disagreement['rf_proba']:.4f}",
-            f"- **LR predicted P(churn=1):** {disagreement['lr_proba']:.4f}",
-            f"- **Probability difference:** {disagreement['prob_diff']:.4f}",
-            "",
-            "## Feature Values",
-            "",
-        ]
-        for feat, val in disagreement["feature_values"].items():
-            md_lines.append(f"- **{feat}:** {val}")
-        md_lines.extend([
-            "",
-            "## Structural Explanation",
-            "The disagreement is likely driven by a threshold-style pattern around `contract_months = 1`, which the random forest can treat as a strong churn signal when combined with the rest of the feature profile. In this sample, the tree model assigned a much higher churn probability (`0.5998`) than logistic regression (`0.1700`), suggesting that the tree captured a rule-like interaction that the linear model smoothed out through additive feature effects. This interpretation is also consistent with the enhanced error analysis, where the same sample appeared among the highest-confidence false positives, showing that the random forest can sometimes overreact to short-contract risk patterns even when the true label is non-churn. :contentReference[oaicite:2]{index=2} :contentReference[oaicite:3]{index=3}"
-        ])
-        with open(disagreement_md_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(md_lines))
-        logger.info("Saved to %s", disagreement_md_path)
+    threshold_df = compute_threshold_table(
+        y_train,
+        oof_probabilities,
+        thresholds=config["thresholds"],
+        customer_base=config["customer_base"],
+    )
+    ensure_parent_dir(output_paths["threshold_tuning_csv"])
+    threshold_df.to_csv(output_paths["threshold_tuning_csv"], index=False)
 
-    # Enhanced analysis: test predictions
-    pred_df = save_test_predictions(
+    selected_threshold_row, threshold_candidates = select_threshold_candidates(
+        threshold_df,
+        strategy=config["threshold_selection_strategy"],
+        recall_target=config["recall_target"],
+        max_alert_rate=config["max_alert_rate"],
+    )
+    selected_threshold = float(selected_threshold_row["threshold"])
+
+    save_threshold_recommendation(
+        best_model_name=best_name,
+        strategy=config["threshold_selection_strategy"],
+        recall_target=config["recall_target"],
+        max_alert_rate=config["max_alert_rate"],
+        threshold_candidates=threshold_candidates,
+        output_path=output_paths["threshold_recommendation"],
+    )
+
+    plot_threshold_sweep(
+        threshold_df=threshold_df,
+        selected_threshold=selected_threshold,
+        output_path=output_paths["threshold_sweep"],
+        max_alert_rate=config["max_alert_rate"],
+    )
+
+    fitted_models = selector.fit_all(X_train, y_train)
+    save_best_model(fitted_models[best_name], output_paths["best_model"])
+    logger.info("Best model by %s: %s", config["selection_metric"], best_name)
+    logger.info("Selected operating threshold from training OOF: %.2f", selected_threshold)
+
+    plot_pr_curves_top3(
         fitted_models,
+        top_model_names,
         X_test,
         y_test,
-        output_path=test_predictions_path,
-        threshold=0.5,
+        output_paths["pr_curves"],
     )
-    logger.info("Saved test predictions to %s (%s rows)", test_predictions_path, len(pred_df))
+    plot_calibration_top3(
+        fitted_models,
+        top_model_names,
+        X_test,
+        y_test,
+        output_paths["calibration"],
+        n_bins=config["calibration_bins"],
+    )
 
-    # Enhanced analysis: calibration metrics
+    if "RF_default" in fitted_models and "LR_default" in fitted_models:
+        disagreement = find_tree_vs_linear_disagreement(
+            fitted_models["RF_default"],
+            fitted_models["LR_default"],
+            X_test,
+            y_test,
+            NUMERIC_FEATURES,
+        )
+        if disagreement:
+            logger.info(
+                "--- Tree-vs-linear disagreement (sample idx=%s) ---",
+                disagreement["sample_idx"],
+            )
+            logger.info(
+                "RF P(churn=1)=%.3f | LR P(churn=1)=%.3f | |diff|=%.3f | true label=%s",
+                disagreement["rf_proba"],
+                disagreement["lr_proba"],
+                disagreement["prob_diff"],
+                disagreement["true_label"],
+            )
+            save_tree_vs_linear_disagreement(disagreement, output_paths["tree_vs_linear"])
+            logger.info("Saved to %s", output_paths["tree_vs_linear"])
+    else:
+        logger.warning(
+            "Skipped tree-vs-linear disagreement analysis because RF_default or LR_default "
+            "is missing from the configured model list."
+        )
+
+    pred_df = save_test_predictions(
+        fitted_models,
+        best_name,
+        selected_threshold,
+        X_test,
+        y_test,
+        output_paths["test_predictions"],
+    )
+    logger.info(
+        "Saved test predictions to %s (%s rows)",
+        output_paths["test_predictions"],
+        len(pred_df),
+    )
+
     calibration_metrics_df = save_calibration_metrics(
         fitted_models,
         X_test,
         y_test,
-        output_path=calibration_metrics_path,
+        output_paths["calibration_metrics"],
         n_bins=config["calibration_bins"],
     )
-    logger.info("Saved calibration metrics to %s", calibration_metrics_path)
+    logger.info("Saved calibration metrics to %s", output_paths["calibration_metrics"])
     logger.info("\n%s", calibration_metrics_df.to_string(index=False))
 
-    # Enhanced analysis: threshold tuning for the selected best model
-    threshold_df = run_threshold_tuning(
+    operating_metrics = evaluate_operating_point(
         fitted_models[best_name],
         X_test,
         y_test,
-        thresholds=config["thresholds"],
-        output_csv_path=threshold_tuning_csv_path,
-        output_plot_path=threshold_tuning_plot_path,
+        selected_threshold,
     )
-    best_f1_row = threshold_df.sort_values("f1", ascending=False).iloc[0]
+    save_json(operating_metrics, output_paths["operating_metrics"])
     logger.info(
-        "Best threshold by test-set F1: %.2f (precision=%.3f, recall=%.3f, f1=%.3f)",
-        best_f1_row["threshold"],
-        best_f1_row["precision"],
-        best_f1_row["recall"],
-        best_f1_row["f1"],
+        "Operating-point test metrics at threshold %.2f: precision=%.3f, recall=%.3f, f1=%.3f, alert_rate=%.3f",
+        selected_threshold,
+        operating_metrics["precision"],
+        operating_metrics["recall"],
+        operating_metrics["f1"],
+        operating_metrics["alert_rate"],
     )
 
-    # Enhanced analysis: error analysis for the selected best model
     error_df = save_error_analysis(
         fitted_models[best_name],
         X_test,
         y_test,
         feature_names=NUMERIC_FEATURES,
-        output_path=error_analysis_path,
-        threshold=0.5,
+        output_path=output_paths["error_analysis"],
+        threshold=selected_threshold,
         top_n=config["error_analysis_top_n"],
     )
-    logger.info("Saved error analysis to %s", error_analysis_path)
+    logger.info("Saved error analysis to %s", output_paths["error_analysis"])
     logger.info("Error type counts: %s", error_df["error_type"].value_counts().to_dict())
 
-    # Save metadata + snapshot outputs into a timestamped run folder
-    save_run_metadata(config, best_name, run_dir, output_path=metadata_path)
-    canonical_outputs = [
-        comparison_table_path,
-        pr_curve_path,
-        calibration_plot_path,
-        best_model_path,
-        experiment_log_path,
-        disagreement_md_path,
-        test_predictions_path,
-        calibration_metrics_path,
-        threshold_tuning_csv_path,
-        threshold_tuning_plot_path,
-        error_analysis_path,
-        metadata_path,
-    ]
-    copy_outputs_to_run_dir(canonical_outputs, run_dir)
+    save_run_metadata(
+        config=config,
+        best_name=best_name,
+        selected_threshold=selected_threshold,
+        run_dir=run_dir,
+        data_quality_report=data_quality_report,
+        threshold_candidates=threshold_candidates,
+        operating_metrics=operating_metrics,
+        output_path=output_paths["run_metadata"],
+    )
 
-    logger.info("--- All results saved to %s and snapshot copied to %s ---", results_root, run_dir)
-    logger.info("Write your decision memo in the PR description (Task 10).")
+    if config["run_snapshot"]:
+        canonical_outputs = [
+            output_paths["comparison_table"],
+            output_paths["pr_curves"],
+            output_paths["calibration"],
+            output_paths["best_model"],
+            output_paths["experiment_log"],
+            output_paths["tree_vs_linear"],
+            output_paths["test_predictions"],
+            output_paths["calibration_metrics"],
+            output_paths["threshold_tuning_csv"],
+            output_paths["threshold_sweep"],
+            output_paths["threshold_recommendation"],
+            output_paths["error_analysis"],
+            output_paths["operating_metrics"],
+            output_paths["run_metadata"],
+            output_paths["data_quality_report"],
+        ]
+        copy_outputs_to_run_dir(canonical_outputs, run_dir)
+
+    logger.info(
+        "--- All results saved to %s and snapshot copied to %s ---",
+        config["results_root"],
+        run_dir,
+    )
+    return 0
+
+
+def main():
+    args = parse_args()
+
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    base_config = load_config(args.config_path)
+    config = apply_cli_overrides(base_config, args)
+    validate_config(config)
+
+    run_dir = None
+    if not args.dry_run:
+        run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_dir = os.path.join(args.output_dir, "runs", run_id)
+
+    output_paths = build_output_paths(
+        args.output_dir,
+        run_dir=run_dir,
+        dry_run=args.dry_run,
+    )
+    logger = setup_logging(output_paths["run_log"], log_level=config["log_level"])
+
+    try:
+        logger.info("Loaded configuration.")
+        logger.info("CLI arguments: %s", vars(args))
+        if os.path.exists(args.config_path):
+            logger.info("Detected config file at %s. CLI arguments take precedence.", args.config_path)
+
+        if args.dry_run:
+            return run_dry_run(logger, config, output_paths)
+
+        return run_full_pipeline(logger, config, output_paths, run_dir)
+
+    except FileNotFoundError as exc:
+        logger.error(str(exc))
+        return 1
+    except ValueError as exc:
+        logger.error("Validation failed: %s", exc)
+        return 1
+    except Exception as exc:
+        logger.exception("Pipeline failed: %s", exc)
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
