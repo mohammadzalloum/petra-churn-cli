@@ -48,7 +48,7 @@ Logistic regression pipelines use median imputation and standard scaling. Tree-b
 ├── README.md
 ├── DECISION_MEMO.md
 ├── requirements.txt
-├── config.json                # optional
+├── config.json                
 ├── data/
 │   └── telecom_churn.csv
 └── output/
