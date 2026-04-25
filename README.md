@@ -44,6 +44,7 @@ Logistic regression pipelines use median imputation and standard scaling. Tree-b
 ```text
 .
 ├── model_comparison.py
+├── setup.sh
 ├── README.md
 ├── DECISION_MEMO.md
 ├── requirements.txt
@@ -70,19 +71,41 @@ Logistic regression pipelines use median imputation and standard scaling. Tree-b
         └── <timestamp>/
 ```
 
-## Installation
+## Setup
 
-Create and activate a virtual environment, then install dependencies.
+### Recommended setup
+
+Use the provided setup script to create the virtual environment and install dependencies automatically.
 
 ```bash
-python -m venv .venv
+chmod +x setup.sh
+./setup.sh
 source .venv/bin/activate
-pip install -r requirements.txt
+```
+
+The setup script will:
+
+- create `.venv` if it does not already exist
+- activate the virtual environment
+- upgrade `pip`, `setuptools`, and `wheel`
+- install packages from `requirements.txt`
+- optionally install `requirements-dev.txt` if it exists
+- optionally run `test_environment.py` if it exists
+
+### Manual setup
+
+If you prefer to set up the environment manually:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip setuptools wheel
+python -m pip install -r requirements.txt
 ```
 
 ## Requirements
 
-Example `requirements.txt`:
+`requirements.txt`:
 
 ```txt
 numpy>=1.24
@@ -94,8 +117,11 @@ scikit-learn>=1.3
 
 ## Usage
 
+After setup, activate the environment and run the CLI with a dataset path:
+
 ```bash
-python model_comparison.py --data-path DATASET.csv [options]
+source .venv/bin/activate
+python model_comparison.py --data-path data/telecom_churn.csv [options]
 ```
 
 ### Arguments
@@ -112,12 +138,19 @@ python model_comparison.py --data-path DATASET.csv [options]
 
 ## Example Commands
 
-### 1) Dry run
+### 1) First-time project setup
 
 ```bash
-python model_comparison.py \
-  --data-path data/telecom_churn.csv \
-  --dry-run
+chmod +x setup.sh
+./setup.sh
+source .venv/bin/activate
+```
+
+### 2) Dry run
+
+```bash
+source .venv/bin/activate
+python model_comparison.py --data-path data/telecom_churn.csv --dry-run
 ```
 
 Use this first to confirm that:
@@ -128,17 +161,17 @@ Use this first to confirm that:
 - cross-validation settings are feasible
 - output paths and configuration are correct
 
-### 2) Standard run
+### 3) Standard run
 
 ```bash
-python model_comparison.py \
-  --data-path data/telecom_churn.csv \
-  --output-dir output
+source .venv/bin/activate
+python model_comparison.py --data-path data/telecom_churn.csv --output-dir output
 ```
 
-### 3) Custom CV and logging level
+### 4) Custom CV and logging level
 
 ```bash
+source .venv/bin/activate
 python model_comparison.py \
   --data-path data/telecom_churn.csv \
   --output-dir output_debug \
@@ -267,7 +300,23 @@ The churn dataset is imbalanced, so accuracy alone is not a reliable ranking cri
 If you see a file-not-found error, confirm the path passed to `--data-path`.
 
 ```bash
+source .venv/bin/activate
 python model_comparison.py --data-path data/telecom_churn.csv --dry-run
+```
+
+### Missing dependencies
+
+If you see an error such as `ModuleNotFoundError`, run setup again:
+
+```bash
+./setup.sh
+source .venv/bin/activate
+```
+
+Or install dependencies manually:
+
+```bash
+python -m pip install -r requirements.txt
 ```
 
 ### Validation failed
